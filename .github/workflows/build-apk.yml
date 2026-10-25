@@ -1,4 +1,4 @@
-name: Build RAPSTAR APK
+name: Build APK
 
 on:
   workflow_dispatch:
@@ -8,94 +8,204 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 30
 
     steps:
       - name: Baixar o projeto
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
 
       - name: Configurar Java
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Configurar Node.js
-        uses: actions/setup-node@v5
-        with:
-          node-version: '20'
-
-      - name: Verificar e preparar o protótipo
+      - name: Definir versao
         shell: bash
         run: |
-          set -e
-          if [ ! -f index.html ]; then
-            echo "::error::index.html não encontrado na raiz do repositório."
-            exit 1
+          echo "VERSION=teste.$GITHUB_RUN_NUMBER" >> "$GITHUB_ENV"
+          echo "VERSION_CODE=$((100000 + GITHUB_RUN_NUMBER))" >> "$GITHUB_ENV"
+
+      - name: Baixar Godot e modelos de exportacao
+        shell: bash
+        run: |
+          FOUND=""
+          for V in 4.6.3 4.6.2 4.6.1 4.5.1; do
+            for REPO in godotengine/godot-builds godotengine/godot; do
+              BASE="https://github.com/$REPO/releases/download/$V-stable"
+              echo ">>> Tentando Godot $V em $REPO"
+              rm -f godot.zip templates.tpz
+              if curl -fL --retry 4 --retry-delay 5 --connect-timeout 30 -o godot.zip "$BASE/Godot_v$V-stable_linux.x86_64.zip" \
+                 && unzip -tq godot.zip > /dev/null 2>&1 \
+                 && curl -fL --retry 4 --retry-delay 5 --connect-timeout 30 -o templates.tpz "$BASE/Godot_v$V-stable_export_templates.tpz" \
+                 && unzip -tq templates.tpz > /dev/null 2>&1; then
+                FOUND="$V"
+                break 2
+              fi
+            done
+          done
+          [ -n "$FOUND" ] || { echo 'ERRO: nao consegui baixar o Godot'; exit 1; }
+          echo "GODOT_VERSION=$FOUND" >> "$GITHUB_ENV"
+          unzip -q godot.zip
+          mv "Godot_v$FOUND-stable_linux.x86_64" godot
+          chmod +x godot
+          mkdir -p "$HOME/.local/share/godot/export_templates" tpl
+          unzip -q templates.tpz -d tpl
+          mv tpl/templates "$HOME/.local/share/godot/export_templates/$FOUND.stable"
+          rm -f godot.zip templates.tpz
+          ./godot --version
+
+      - name: Preparar projeto Godot
+        shell: bash
+        run: |
+          PROJ=""
+          for Z in *.zip; do
+            [ -f "$Z" ] || continue
+            if unzip -l "$Z" 2>/dev/null | grep -q 'project.godot'; then
+              D="proj_unzipped/${Z%.zip}"
+              mkdir -p "$D"
+              unzip -q "$Z" -d "$D"
+              GFILE=$(find "$D" -name project.godot | sed -n '1p')
+              if [ -n "$GFILE" ]; then
+                PROJ=$(dirname "$GFILE")
+                echo ">>> Jogo encontrado no ZIP: $Z"
+                break
+              fi
+            fi
+          done
+          if [ -z "$PROJ" ]; then
+            GFILE=$(find . -path ./proj_unzipped -prune -o -path ./tpl -prune -o -name project.godot -print | sed -n '1p')
+            [ -n "$GFILE" ] && PROJ=$(dirname "$GFILE")
+          fi
+          [ -n "$PROJ" ] || { echo 'ERRO: project.godot nao encontrado'; exit 1; }
+          echo "PROJ=$PROJ" >> "$GITHUB_ENV"
+          echo ">>> Projeto em: $PROJ"
+
+          # Nome e pacote saem do project.godot
+          NAME=$(sed -n 's/^config\/name="\(.*\)"$/\1/p' "$PROJ/project.godot" | sed -n '1p')
+          [ -n "$NAME" ] || NAME="Game"
+          SLUG=$(printf '%s' "$NAME" | tr -cd 'A-Za-z0-9')
+          [ -n "$SLUG" ] || SLUG="Game"
+          case "$SLUG" in [0-9]*) SLUG="G$SLUG" ;; esac
+          PKG="com.$(printf '%s' "$SLUG" | tr 'A-Z' 'a-z').game"
+          echo "SLUG=$SLUG" >> "$GITHUB_ENV"
+          echo ">>> Nome: $NAME | arquivo: $SLUG | pacote: $PKG"
+
+          # export_presets.cfg
+          printf '%s\n' \
+            '[preset.0]' \
+            '' \
+            'name="Android"' \
+            'platform="Android"' \
+            'runnable=true' \
+            'advanced_options=false' \
+            'dedicated_server=false' \
+            'custom_features=""' \
+            'export_filter="all_resources"' \
+            'include_filter=""' \
+            'exclude_filter="tests/*, tools/*, docs/*, *.md"' \
+            'export_path="build/game-debug.apk"' \
+            'encryption_include_filters=""' \
+            'encryption_exclude_filters=""' \
+            'encrypt_pck=false' \
+            'encrypt_directory=false' \
+            '' \
+            '[preset.0.options]' \
+            '' \
+            'custom_template/debug=""' \
+            'custom_template/release=""' \
+            'gradle_build/use_gradle_build=false' \
+            'gradle_build/export_format=0' \
+            'architectures/armeabi-v7a=false' \
+            'architectures/arm64-v8a=true' \
+            'architectures/x86=false' \
+            'architectures/x86_64=false' \
+            "version/code=$VERSION_CODE" \
+            "version/name=\"$VERSION\"" \
+            "package/unique_name=\"$PKG\"" \
+            "package/name=\"$NAME\"" \
+            'package/signed=true' \
+            'screen/immersive_mode=true' \
+            'permissions/internet=false' \
+            > "$PROJ/export_presets.cfg"
+          if [ -f "$PROJ/assets/icon.png" ]; then
+            echo 'launcher_icons/main_192x192="res://assets/icon.png"' >> "$PROJ/export_presets.cfg"
+          fi
+          if [ -f "$PROJ/assets/icon_fg_432.png" ] && [ -f "$PROJ/assets/icon_bg_432.png" ]; then
+            echo 'launcher_icons/adaptive_foreground_432x432="res://assets/icon_fg_432.png"' >> "$PROJ/export_presets.cfg"
+            echo 'launcher_icons/adaptive_background_432x432="res://assets/icon_bg_432.png"' >> "$PROJ/export_presets.cfg"
           fi
 
-          mkdir -p www
-          cp index.html www/index.html
+          # ETC2/ASTC exigido pela exportacao Android
+          F="$PROJ/project.godot"
+          if grep -q 'import_etc2_astc' "$F"; then
+            sed -i 's|^textures/vram_compression/import_etc2_astc=.*|textures/vram_compression/import_etc2_astc=true|' "$F"
+          elif grep -q '^\[rendering\]' "$F"; then
+            sed -i '/^\[rendering\]/a textures/vram_compression/import_etc2_astc=true' "$F"
+          else
+            printf '\n[rendering]\ntextures/vram_compression/import_etc2_astc=true\n' >> "$F"
+          fi
 
-          cat > package.json <<'JSON'
-          {
-            "name": "rapstar-after-hours",
-            "version": "1.0.0",
-            "private": true,
-            "dependencies": {
-              "@capacitor/core": "^6.2.1",
-              "@capacitor/android": "^6.2.1"
-            },
-            "devDependencies": {
-              "@capacitor/cli": "^6.2.1"
-            }
-          }
-          JSON
+      - name: Preparar Android SDK e chave de debug
+        shell: bash
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" "$ANDROID_HOME" || true
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$SDKM" ] || SDKM=$(find "$ANDROID_HOME" -name sdkmanager -type f | head -n 1)
+          yes | "$SDKM" --licenses > /dev/null || true
+          for P in "platform-tools" "build-tools;34.0.0" "build-tools;35.0.1" "platforms;android-34" "platforms;android-35"; do
+            "$SDKM" --install "$P" || echo "AVISO: nao instalou $P (continuando)"
+          done
+          keytool -genkeypair -keystore "$HOME/debug.keystore" -storepass android \
+            -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 \
+            -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+          mkdir -p "$HOME/.config/godot"
+          for F in editor_settings-4.tres editor_settings-4.6.tres editor_settings-4.7.tres; do
+            printf '%s\n' \
+              '[gd_resource type="EditorSettings" format=3]' \
+              '' \
+              '[resource]' \
+              "export/android/java_sdk_path = \"$JAVA_HOME\"" \
+              "export/android/android_sdk_path = \"$ANDROID_HOME\"" \
+              "export/android/debug_keystore = \"$HOME/debug.keystore\"" \
+              'export/android/debug_keystore_user = "androiddebugkey"' \
+              'export/android/debug_keystore_pass = "android"' \
+              > "$HOME/.config/godot/$F"
+          done
 
-          cat > capacitor.config.json <<'JSON'
-          {
-            "appId": "com.afterhours.rapstar",
-            "appName": "RAPSTAR After Hours",
-            "webDir": "www",
-            "bundledWebRuntime": false
-          }
-          JSON
-
-          npm install
-          npx cap add android
-          npx cap sync android
+      - name: Importar recursos
+        run: ./godot --headless --path "$PROJ" --import || true
 
       - name: Compilar APK
         shell: bash
         run: |
-          set -e
-          cd android
-          chmod +x gradlew
-          ./gradlew assembleDebug --no-daemon
-
-      - name: Verificar APK
-        shell: bash
-        run: |
-          APK="android/app/build/outputs/apk/debug/app-debug.apk"
+          mkdir -p out
+          APK="$GITHUB_WORKSPACE/out/$SLUG-$VERSION.apk"
+          ./godot --headless --path "$PROJ" --export-debug "Android" "$APK" 2>&1 | tee export.log || true
           if [ ! -s "$APK" ]; then
-            echo "::error::O APK não foi gerado."
+            echo "ERRO: o APK nao foi criado. Linhas de erro:"
+            grep -n -i -E "error|invalid|missing|not found|failed|cannot" export.log | head -n 40 || true
+            tail -n 40 export.log
             exit 1
           fi
-          mkdir -p out
-          cp "$APK" out/RAPSTAR-AFTER-HOURS-debug.apk
-          sha256sum out/RAPSTAR-AFTER-HOURS-debug.apk
+          ls -l out
+          sha256sum "$APK"
 
-      - name: Disponibilizar APK
+      - name: Publicar APK para download
         uses: actions/upload-artifact@v4
         with:
-          name: RAPSTAR-AFTER-HOURS-APK
-          path: out/RAPSTAR-AFTER-HOURS-debug.apk
+          name: ${{ env.SLUG }}-${{ env.VERSION }}-debug-APK
+          path: out/*.apk
           if-no-files-found: error
           retention-days: 14
-          
+
+      - name: Guardar log do Godot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: godot-export-log
+          path: export.log
+          if-no-files-found: ignore
